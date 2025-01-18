@@ -1,75 +1,42 @@
 <?php
 
-require __DIR__ . '/vendor/autoload.php';
+require 'vendor/autoload.php';
 
-use Dotenv\Dotenv;
-use Google_Client;
-use Monolog\Logger;
-use Monolog\Handler\StreamHandler;
-use React\EventLoop\Factory;
-use React\MySQL\Factory as MySQLFactory;
 use YoutubeChatCapture\ChatCapture;
 use YoutubeChatCapture\YouTubeHelper;
+use YoutubeChatCapture\Models\Stream;
+use React\EventLoop\Loop;
+use Monolog\Logger;
 
-// Load environment variables
-$dotenv = Dotenv::createImmutable(__DIR__);
-$dotenv->load();
-$dotenv->required([
-    'YOUTUBE_API_KEY',
-    'MYSQL_HOST',
-    'MYSQL_USER',
-    'MYSQL_PASSWORD',
-    'MYSQL_DATABASE',
-    'YOUTUBE_URL'
-]);
-
-// Initialize logger
 $logger = new Logger('youtube-chat-capture');
-$logger->pushHandler(new StreamHandler('php://stderr', Logger::DEBUG));
+$loop = Loop::get();
 
-try {
-    // Initialize Google Client
-    $client = new Google_Client();
-    $client->setDeveloperKey($_ENV['YOUTUBE_API_KEY']);
-    $client->setApplicationName('YouTube Chat Capture');
+$helper = new YouTubeHelper();
+$client = $helper->getClient();
+$capture = new ChatCapture($client, $loop, $logger);
 
-    // Get Live Chat ID from YouTube URL
-    $youtubeHelper = new YouTubeHelper($client);
-    $liveChatId = $youtubeHelper->getLiveChatId($_ENV['YOUTUBE_URL']);
-    $logger->info('Retrieved Live Chat ID: ' . $liveChatId);
+// Get active streams
+$activeStreams = Stream::findActive();
 
-    // Initialize Event Loop
-    $loop = Factory::create();
-
-    // Initialize MySQL Connection
-    $mysql = new MySQLFactory($loop);
-    $uri = sprintf(
-        'mysql://%s:%s@%s/%s',
-        $_ENV['MYSQL_USER'],
-        $_ENV['MYSQL_PASSWORD'],
-        $_ENV['MYSQL_HOST'],
-        $_ENV['MYSQL_DATABASE']
-    );
-    
-    $mysql->createConnection($uri)->then(
-        function ($connection) use ($client, $loop, $logger, $liveChatId) {
-            $logger->info('Connected to MySQL database');
-            
-            // Initialize and start chat capture
-            $chatCapture = new ChatCapture($client, $connection, $loop, $logger);
-            $chatCapture->startCapture($liveChatId);
-            
-            $logger->info('Chat capture started');
-        },
-        function (\Exception $e) use ($logger) {
-            $logger->error('Could not connect to MySQL: ' . $e->getMessage());
-            exit(1);
+foreach ($activeStreams as $stream) {
+    try {
+        // Get live chat ID if not already set
+        if (!$stream->live_chat_id) {
+            $liveChatId = $helper->getLiveChatId($stream->youtube_url);
+            if ($liveChatId) {
+                $stream->update(['live_chat_id' => $liveChatId]);
+            } else {
+                $logger->error("Could not get live chat ID for stream: " . $stream->youtube_url);
+                continue;
+            }
         }
-    );
 
-    // Run the event loop
-    $loop->run();
-} catch (\Exception $e) {
-    $logger->error('Fatal error: ' . $e->getMessage());
-    exit(1);
-} 
+        // Start capturing for this stream
+        $capture->startCapture($stream->live_chat_id);
+        $logger->info("Started capturing chat for stream: " . $stream->youtube_url);
+    } catch (Exception $e) {
+        $logger->error("Error processing stream {$stream->youtube_url}: " . $e->getMessage());
+    }
+}
+
+$loop->run(); 

@@ -2,24 +2,24 @@
 
 namespace YoutubeChatCapture;
 
-use Google_Client;
-use Google_Service_YouTube;
+use Google\Client;
+use Google\Service\YouTube;
+use Google\Service\Exception as GoogleException;
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use React\EventLoop\LoopInterface;
-use React\MySQL\ConnectionInterface;
-use React\Promise\PromiseInterface;
+use YoutubeChatCapture\Models\ChatMessage;
+use YoutubeChatCapture\Models\ProcessingBatch;
 
 class ChatCapture
 {
     private const BATCH_SIZE = 1000;
-    private const PROCESS_INTERVAL = 0.1; // seconds
+    private const PROCESS_INTERVAL = 3; // seconds
     private array $messageBuffer = [];
     private ?string $nextPageToken = null;
 
     public function __construct(
-        private readonly Google_Client $client,
-        private readonly ConnectionInterface $db,
+        private readonly Client $client,
         private readonly LoopInterface $loop,
         private readonly Logger $logger
     ) {
@@ -28,19 +28,18 @@ class ChatCapture
 
     public function startCapture(string $liveChatId): void
     {
-        $youtube = new Google_Service_YouTube($this->client);
+        $youtube = new YouTube($this->client);
 
         // Set up periodic chat message fetching
         $this->loop->addPeriodicTimer(self::PROCESS_INTERVAL, function () use ($youtube, $liveChatId) {
-            $this->fetchChatMessages($youtube, $liveChatId)
-                ->then(function () {
-                    if (count($this->messageBuffer) >= self::BATCH_SIZE) {
-                        $this->processBatch();
-                    }
-                })
-                ->catch(function (\Exception $e) {
-                    $this->logger->error('Error fetching chat messages: ' . $e->getMessage());
-                });
+            try {
+                $this->fetchChatMessages($youtube, $liveChatId);
+                if (count($this->messageBuffer) >= self::BATCH_SIZE) {
+                    $this->processBatch();
+                }
+            } catch (\Exception $e) {
+                $this->logger->error('Error fetching chat messages: ' . $e->getMessage());
+            }
         });
 
         // Set up periodic batch processing for remaining messages
@@ -51,38 +50,75 @@ class ChatCapture
         });
     }
 
-    private function fetchChatMessages(Google_Service_YouTube $youtube, string $liveChatId): PromiseInterface
+    private function getChannelName(YouTube $youtube, string $channelId): string
     {
-        return \React\Promise\resolve()->then(function () use ($youtube, $liveChatId) {
-            $params = [
-                'liveChatId' => $liveChatId,
-                'part' => 'snippet,authorDetails',
-                'maxResults' => 2000
+        try {
+            $response = $youtube->channels->listChannels('snippet', [
+                'id' => $channelId
+            ]);
+
+            if ($response->getItems()) {
+                return $response->getItems()[0]->getSnippet()->getTitle();
+            }
+            
+            return '';
+        } catch (\Exception $e) {
+            $this->logger->error('Error fetching channel name: ' . $e->getMessage());
+            return '';
+        }
+    }
+
+    private function fetchChatMessages(YouTube $youtube, string $liveChatId): void
+    {
+        try {
+            $optParams = [
+                'maxResults' => 50
             ];
 
             if ($this->nextPageToken) {
-                $params['pageToken'] = $this->nextPageToken;
+                $optParams['pageToken'] = $this->nextPageToken;
             }
 
+            $this->logger->info('API Request params: ' . json_encode($optParams));
+            
             try {
-                $response = $youtube->liveChatMessages->listLiveChatMessages($liveChatId, $params);
-                $this->nextPageToken = $response->getNextPageToken();
-
-                foreach ($response->getItems() as $message) {
-                    $this->messageBuffer[] = [
-                        'message_content' => $message->getSnippet()->getDisplayMessage(),
-                        'user_youtube_id' => $message->getAuthorDetails()->getChannelId(),
-                        'user_display_name' => $message->getAuthorDetails()->getDisplayName(),
-                        'timestamp' => date('Y-m-d H:i:s.u', strtotime($message->getSnippet()->getPublishedAt())),
-                        'chat_id' => $liveChatId,
-                        'live_stream_id' => $message->getSnippet()->getLiveChatId()
-                    ];
-                }
-            } catch (\Exception $e) {
-                $this->logger->error('Error fetching messages: ' . $e->getMessage());
+                $response = $youtube->liveChatMessages->listLiveChatMessages(
+                    $liveChatId,
+                    'id,snippet',
+                    $optParams
+                );
+                $this->logger->info('Raw API Response: ' . json_encode($response));
+            } catch (GoogleException $e) {
+                $this->logger->error('Google API Error: ' . json_encode([
+                    'message' => $e->getMessage(),
+                    'code' => $e->getCode(),
+                    'errors' => $e->getErrors()
+                ]));
                 throw $e;
             }
-        });
+
+            $this->nextPageToken = $response->nextPageToken;
+
+            foreach ($response->getItems() as $message) {
+                $snippet = $message->getSnippet();
+                $authorChannelId = $snippet->getAuthorChannelId();
+                $channelId = is_object($authorChannelId) ? $authorChannelId->getChannelId() : $authorChannelId;
+                
+                $this->messageBuffer[] = [
+                    'message_content' => $snippet->getTextMessageDetails() ? $snippet->getTextMessageDetails()->getMessageText() : '',
+                    'user_youtube_id' => $channelId,
+                    'user_display_name' => $this->getChannelName($youtube, $channelId),
+                    'timestamp' => date('Y-m-d H:i:s.u', strtotime($snippet->getPublishedAt())),
+                    'chat_id' => $liveChatId,
+                    'live_stream_id' => $snippet->getLiveChatId()
+                ];
+            }
+
+            $this->logger->info('Successfully fetched ' . count($response->getItems()) . ' messages');
+        } catch (\Exception $e) {
+            $this->logger->error('Error fetching messages: ' . $e->getMessage());
+            throw $e;
+        }
     }
 
     private function processBatch(): void
@@ -91,44 +127,35 @@ class ChatCapture
             return;
         }
 
-        $batch = array_splice($this->messageBuffer, 0, self::BATCH_SIZE);
-        
-        // Create batch record
-        $this->db->query(
-            'INSERT INTO processing_batches (batch_status, started_at) VALUES (?, NOW(3))',
-            ['processing']
-        )->then(function ($result) use ($batch) {
-            $batchId = $result->insertId;
+        try {
+            // Create batch record
+            $batch = ProcessingBatch::create([
+                'batch_status' => 'processing',
+                'started_at' => date('Y-m-d H:i:s')
+            ]);
+
+            $messages = array_splice($this->messageBuffer, 0, self::BATCH_SIZE);
             
-            // Prepare bulk insert
-            $placeholders = [];
-            $values = [];
-            foreach ($batch as $message) {
-                $placeholders[] = '(?, ?, ?, ?, ?, ?)';
-                $values = array_merge($values, [
-                    $message['message_content'],
-                    $message['user_youtube_id'],
-                    $message['user_display_name'],
-                    $message['timestamp'],
-                    $message['chat_id'],
-                    $message['live_stream_id']
-                ]);
+            // Insert messages in chunks to avoid memory issues
+            foreach (array_chunk($messages, 100) as $chunk) {
+                ChatMessage::insert($chunk);
             }
 
-            $sql = 'INSERT INTO chat_messages (message_content, user_youtube_id, user_display_name, timestamp, chat_id, live_stream_id) VALUES ' . 
-                   implode(', ', $placeholders);
+            // Update batch status
+            $batch->update([
+                'batch_status' => 'completed',
+                'completed_at' => date('Y-m-d H:i:s')
+            ]);
 
-            return $this->db->query($sql, $values)->then(
-                function () use ($batchId) {
-                    return $this->db->query(
-                        'UPDATE processing_batches SET batch_status = ?, completed_at = NOW(3) WHERE id = ?',
-                        ['completed', $batchId]
-                    );
-                }
-            );
-        })->catch(function (\Exception $e) {
+            $this->logger->info('Processed batch #' . $batch->id . ' with ' . count($messages) . ' messages');
+        } catch (\Exception $e) {
+            if (isset($batch)) {
+                $batch->update([
+                    'batch_status' => 'failed',
+                    'error_message' => $e->getMessage()
+                ]);
+            }
             $this->logger->error('Error processing batch: ' . $e->getMessage());
-            throw $e;
-        });
+        }
     }
 } 
